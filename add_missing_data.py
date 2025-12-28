@@ -3,91 +3,143 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 
+# =========================
+# HELPER: SAFE BBOX PARSER
+# =========================
+def parse_bbox(bbox_str):
+    """
+    Parses bbox strings like:
+    '[123 45 678 910]' OR '[123, 45, 678, 910]'
+    """
+    bbox_str = bbox_str.replace('[', '').replace(']', '').replace(',', ' ')
+    return list(map(float, bbox_str.split()))
+
+
+# =========================
+# INTERPOLATION FUNCTION
+# =========================
 def interpolate_bounding_boxes(data):
-    # Extract necessary data columns from input data
+
+    if len(data) == 0:
+        raise RuntimeError("❌ test.csv is empty. Run main.py first and ensure detections are written.")
+
+    # Extract columns safely
     frame_numbers = np.array([int(row['frame_nmr']) for row in data])
     car_ids = np.array([int(float(row['car_id'])) for row in data])
-    car_bboxes = np.array([list(map(float, row['car_bbox'][1:-1].split())) for row in data])
-    license_plate_bboxes = np.array([list(map(float, row['license_plate_bbox'][1:-1].split())) for row in data])
+
+    car_bboxes = np.array([parse_bbox(row['car_bbox']) for row in data])
+    license_plate_bboxes = np.array([parse_bbox(row['license_plate_bbox']) for row in data])
 
     interpolated_data = []
+
     unique_car_ids = np.unique(car_ids)
+
     for car_id in unique_car_ids:
 
-        frame_numbers_ = [p['frame_nmr'] for p in data if int(float(p['car_id'])) == int(float(car_id))]
-        print(frame_numbers_, car_id)
-
-        # Filter data for a specific car ID
+        # Filter rows for this car
         car_mask = car_ids == car_id
+
         car_frame_numbers = frame_numbers[car_mask]
+        car_frame_numbers = np.sort(car_frame_numbers)   # 🔴 CRITICAL FIX
+
+        car_bboxes_filtered = car_bboxes[car_mask]
+        license_bboxes_filtered = license_plate_bboxes[car_mask]
+
+        first_frame = car_frame_numbers[0]
+        last_frame = car_frame_numbers[-1]
+
         car_bboxes_interpolated = []
-        license_plate_bboxes_interpolated = []
+        license_bboxes_interpolated = []
 
-        first_frame_number = car_frame_numbers[0]
-        last_frame_number = car_frame_numbers[-1]
-
-        for i in range(len(car_bboxes[car_mask])):
+        for i in range(len(car_frame_numbers)):
             frame_number = car_frame_numbers[i]
-            car_bbox = car_bboxes[car_mask][i]
-            license_plate_bbox = license_plate_bboxes[car_mask][i]
+            car_bbox = car_bboxes_filtered[i]
+            license_bbox = license_bboxes_filtered[i]
 
             if i > 0:
-                prev_frame_number = car_frame_numbers[i-1]
+                prev_frame = car_frame_numbers[i - 1]
                 prev_car_bbox = car_bboxes_interpolated[-1]
-                prev_license_plate_bbox = license_plate_bboxes_interpolated[-1]
+                prev_license_bbox = license_bboxes_interpolated[-1]
 
-                if frame_number - prev_frame_number > 1:
-                    # Interpolate missing frames' bounding boxes
-                    frames_gap = frame_number - prev_frame_number
-                    x = np.array([prev_frame_number, frame_number])
-                    x_new = np.linspace(prev_frame_number, frame_number, num=frames_gap, endpoint=False)
-                    interp_func = interp1d(x, np.vstack((prev_car_bbox, car_bbox)), axis=0, kind='linear')
-                    interpolated_car_bboxes = interp_func(x_new)
-                    interp_func = interp1d(x, np.vstack((prev_license_plate_bbox, license_plate_bbox)), axis=0, kind='linear')
-                    interpolated_license_plate_bboxes = interp_func(x_new)
+                gap = frame_number - prev_frame
 
-                    car_bboxes_interpolated.extend(interpolated_car_bboxes[1:])
-                    license_plate_bboxes_interpolated.extend(interpolated_license_plate_bboxes[1:])
+                if gap > 1:
+                    x = np.array([prev_frame, frame_number])
+                    x_new = np.linspace(prev_frame, frame_number, gap, endpoint=False)
+
+                    car_interp = interp1d(x, np.vstack((prev_car_bbox, car_bbox)), axis=0)
+                    lic_interp = interp1d(x, np.vstack((prev_license_bbox, license_bbox)), axis=0)
+
+                    car_bboxes_interpolated.extend(car_interp(x_new)[1:])
+                    license_bboxes_interpolated.extend(lic_interp(x_new)[1:])
 
             car_bboxes_interpolated.append(car_bbox)
-            license_plate_bboxes_interpolated.append(license_plate_bbox)
+            license_bboxes_interpolated.append(license_bbox)
 
+        # =========================
+        # WRITE INTERPOLATED ROWS
+        # =========================
         for i in range(len(car_bboxes_interpolated)):
-            frame_number = first_frame_number + i
-            row = {}
-            row['frame_nmr'] = str(frame_number)
-            row['car_id'] = str(car_id)
-            row['car_bbox'] = ' '.join(map(str, car_bboxes_interpolated[i]))
-            row['license_plate_bbox'] = ' '.join(map(str, license_plate_bboxes_interpolated[i]))
+            frame_number = first_frame + i
 
-            if str(frame_number) not in frame_numbers_:
-                # Imputed row, set the following fields to '0'
+            row = {
+                'frame_nmr': str(frame_number),
+                'car_id': str(car_id),
+                'car_bbox': ' '.join(map(str, car_bboxes_interpolated[i])),
+                'license_plate_bbox': ' '.join(map(str, license_bboxes_interpolated[i]))
+            }
+
+            # Check if original frame exists
+            original_rows = [
+                r for r in data
+                if int(r['frame_nmr']) == frame_number and int(float(r['car_id'])) == car_id
+            ]
+
+            if len(original_rows) == 0:
+                # Interpolated frame
                 row['license_plate_bbox_score'] = '0'
-                row['license_number'] = '0'
+                row['license_number'] = ''
                 row['license_number_score'] = '0'
             else:
-                # Original row, retrieve values from the input data if available
-                original_row = [p for p in data if int(p['frame_nmr']) == frame_number and int(float(p['car_id'])) == int(float(car_id))][0]
-                row['license_plate_bbox_score'] = original_row['license_plate_bbox_score'] if 'license_plate_bbox_score' in original_row else '0'
-                row['license_number'] = original_row['license_number'] if 'license_number' in original_row else '0'
-                row['license_number_score'] = original_row['license_number_score'] if 'license_number_score' in original_row else '0'
+                # Original frame
+                original = original_rows[0]
+                row['license_plate_bbox_score'] = original.get('license_plate_bbox_score', '0')
+                row['license_number'] = original.get('license_number', '')
+                row['license_number_score'] = original.get('license_number_score', '0')
 
             interpolated_data.append(row)
 
     return interpolated_data
 
 
-# Load the CSV file
+# =========================
+# LOAD INPUT CSV
+# =========================
 with open('test.csv', 'r') as file:
     reader = csv.DictReader(file)
     data = list(reader)
 
-# Interpolate missing data
+# =========================
+# RUN INTERPOLATION
+# =========================
 interpolated_data = interpolate_bounding_boxes(data)
 
-# Write updated data to a new CSV file
-header = ['frame_nmr', 'car_id', 'car_bbox', 'license_plate_bbox', 'license_plate_bbox_score', 'license_number', 'license_number_score']
+# =========================
+# WRITE OUTPUT CSV
+# =========================
+header = [
+    'frame_nmr',
+    'car_id',
+    'car_bbox',
+    'license_plate_bbox',
+    'license_plate_bbox_score',
+    'license_number',
+    'license_number_score'
+]
+
 with open('test_interpolated.csv', 'w', newline='') as file:
     writer = csv.DictWriter(file, fieldnames=header)
     writer.writeheader()
     writer.writerows(interpolated_data)
+
+print("✅ test_interpolated.csv generated successfully")
